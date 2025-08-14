@@ -63,7 +63,7 @@ func revFile(path string, baseDir string) string {
 
 func rev(baseDir string, cdnBaseUrl string) map[string]string {
     lsrcpath := len(baseDir)
-    repath := regexp.MustCompile(`^` + baseDir + `/assets/.+(\.css|\.js|\.jpg|\.png|\.svg|\.ico|\.mp4|\.woff2)$`)
+    repath := regexp.MustCompile(`^` + baseDir + `/assets/.+(\.css|\.js|\.jpg|\.png|\.svg|\.ico|\.mp4|\.woff2|\.avif)$`)
     err := os.MkdirAll(baseDir + "/assets-rev", os.ModePerm)
     check(err)
     m := make(map[string]string)
@@ -81,7 +81,7 @@ func rev(baseDir string, cdnBaseUrl string) map[string]string {
 }
 
 func repFile(path string, manifest map[string]string) {
-    repath := regexp.MustCompile(`["'\(]/assets/.+?(?:\.css|\.js|\.jpg|\.png|\.svg|\.ico|\.mp4|\.woff2)["'\)]`)
+    repath := regexp.MustCompile(`["'\(]/assets/.+?(?:\.css|\.js|\.jpg|\.png|\.svg|\.ico|\.mp4|\.woff2|\.avif)["'\)]`)
     input, err := ioutil.ReadFile(path)
     check(err)
     lines := strings.Split(string(input), "\n")
