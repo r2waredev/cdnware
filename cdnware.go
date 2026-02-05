@@ -62,8 +62,16 @@ func revFile(path string, baseDir string, destDir string) string {
 }
 
 func rev(baseDir string, cdnBaseUrl string, srcDir string, destDir string) map[string]string {
-    lsrcpath := len(baseDir)
-    repath := regexp.MustCompile(`^` + baseDir + `/` + srcDir + `/.+(\.css|\.js|\.jpg|\.png|\.svg|\.ico|\.mp4|\.woff2|\.avif)$`)
+    // Build regex pattern - handle "." baseDir specially since filepath.Walk
+    // returns paths without "./" prefix
+    var pathPrefix string
+    if baseDir == "." {
+        pathPrefix = ""
+    } else {
+        pathPrefix = baseDir + "/"
+    }
+    lsrcpath := len(pathPrefix)
+    repath := regexp.MustCompile(`^` + regexp.QuoteMeta(pathPrefix+srcDir) + `/.+(\.css|\.js|\.jpg|\.png|\.svg|\.ico|\.mp4|\.woff2|\.avif)$`)
     err := os.MkdirAll(filepath.Join(baseDir, destDir), os.ModePerm)
     check(err)
     m := make(map[string]string)
@@ -72,7 +80,7 @@ func rev(baseDir string, cdnBaseUrl string, srcDir string, destDir string) map[s
         matched := repath.MatchString(path)
         if matched == true {
             rev := revFile(path, baseDir, destDir)[lsrcpath:]
-            m[path[lsrcpath:]] = fmt.Sprintf("%s%s", cdnBaseUrl, rev)
+            m["/"+path[lsrcpath:]] = fmt.Sprintf("%s/%s", cdnBaseUrl, rev)
         }
         return nil
     })
@@ -123,7 +131,7 @@ func useman(manifest map[string]string, baseDir string, srcDir string) {
 func getUsage() string {
     usage := `Usage of cdnware:
 
-$ cdnware [OPTIONS] SITEROOT
+$ cdnware [OPTIONS] [SITEROOT]
 `
     return usage
 }
@@ -143,14 +151,11 @@ func parseFlags() (string, string, string, string) {
     }
 
     flag.Parse()
-    if flag.NArg() != 1 {
-        flag.Usage()
-        fmt.Println("Missing required positional argument: SITEROOT")
-        os.Exit(1)
+    
+    baseDir := "."
+    if flag.NArg() > 0 {
+        baseDir = flag.Arg(0)
     }
-
-    largs := len(os.Args)
-    baseDir := os.Args[largs-1]
 
     return baseDir, cdnBaseUrl, srcDir, destDir
 }
