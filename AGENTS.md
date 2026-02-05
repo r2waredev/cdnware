@@ -9,7 +9,8 @@ This file provides guidance to WARP (warp.dev) when working with code in this re
 ## Build & Run
 
 ```bash
-go build                                    # Build binary
+just build                                  # Build binary
+just test                                   # Run tests
 ./cdnware -cdn https://cdn.example.com _site  # Run against a site directory
 ./cdnware -cdn https://cdn.example.com -src static -dest static-rev _site  # Custom directories
 ```
