@@ -49,29 +49,29 @@ func copyFile (srcPath string, destPath string) {
     check(err)
 }
 
-func revFile(path string, baseDir string) string {
+func revFile(path string, baseDir string, destDir string) string {
     fhash := hashFile(path)
     _, fname := filepath.Split(path)
     parts := strings.Split(fname, ".")
     lindex := len(parts) - 1
     parts = append(parts[:lindex], fhash, parts[lindex])
     hashName := strings.Join(parts, ".")
-    hashPath := filepath.Join(baseDir + "/assets-rev", hashName)
+    hashPath := filepath.Join(baseDir, destDir, hashName)
     copyFile(path, hashPath)
     return hashPath
 }
 
-func rev(baseDir string, cdnBaseUrl string) map[string]string {
+func rev(baseDir string, cdnBaseUrl string, srcDir string, destDir string) map[string]string {
     lsrcpath := len(baseDir)
-    repath := regexp.MustCompile(`^` + baseDir + `/assets/.+(\.css|\.js|\.jpg|\.png|\.svg|\.ico|\.mp4|\.woff2|\.avif)$`)
-    err := os.MkdirAll(baseDir + "/assets-rev", os.ModePerm)
+    repath := regexp.MustCompile(`^` + baseDir + `/` + srcDir + `/.+(\.css|\.js|\.jpg|\.png|\.svg|\.ico|\.mp4|\.woff2|\.avif)$`)
+    err := os.MkdirAll(filepath.Join(baseDir, destDir), os.ModePerm)
     check(err)
     m := make(map[string]string)
     err = filepath.Walk(baseDir, func(path string, info fs.FileInfo, err error) error {
         check(err)
         matched := repath.MatchString(path)
         if matched == true {
-            rev := revFile(path, baseDir)[lsrcpath:]
+            rev := revFile(path, baseDir, destDir)[lsrcpath:]
             m[path[lsrcpath:]] = fmt.Sprintf("%s%s", cdnBaseUrl, rev)
         }
         return nil
@@ -80,8 +80,8 @@ func rev(baseDir string, cdnBaseUrl string) map[string]string {
     return m
 }
 
-func repFile(path string, manifest map[string]string) {
-    repath := regexp.MustCompile(`["'\(]/assets/.+?(?:\.css|\.js|\.jpg|\.png|\.svg|\.ico|\.mp4|\.woff2|\.avif)["'\)]`)
+func repFile(path string, manifest map[string]string, srcDir string) {
+    repath := regexp.MustCompile(`["'\(]/` + srcDir + `/.+?(?:\.css|\.js|\.jpg|\.png|\.svg|\.ico|\.mp4|\.woff2|\.avif)["'\)]`)
     input, err := ioutil.ReadFile(path)
     check(err)
     lines := strings.Split(string(input), "\n")
@@ -105,15 +105,15 @@ func repFile(path string, manifest map[string]string) {
     check(err)
 }
 
-func useman(manifest map[string]string, baseDir string) {
+func useman(manifest map[string]string, baseDir string, srcDir string) {
     repath := regexp.MustCompile(`^` + baseDir + `/.+(\.css|\.js|\.html|\.webmanifest)$`)
-    expath := regexp.MustCompile(`^` + baseDir + `/assets/`)
+    expath := regexp.MustCompile(`^` + baseDir + `/` + srcDir + `/`)
     err := filepath.Walk(baseDir, func(path string, info fs.FileInfo, err error) error {
         check(err)
         matched := repath.MatchString(path)
         excluded := expath.MatchString(path)
         if matched == true  && excluded != true {
-            repFile(path, manifest)
+            repFile(path, manifest, srcDir)
         }
         return nil
     })
@@ -121,16 +121,20 @@ func useman(manifest map[string]string, baseDir string) {
 }
 
 func getUsage() string {
-    usage := `Usage of cndware:
+    usage := `Usage of cdnware:
 
 $ cdnware [OPTIONS] SITEROOT
 `
     return usage
 }
 
-func parseFlags() (string, string) {
+func parseFlags() (string, string, string, string) {
     var cdnBaseUrl string
+    var srcDir string
+    var destDir string
     flag.StringVar(&cdnBaseUrl, "cdn", "", "CDN base url")
+    flag.StringVar(&srcDir, "src", "assets", "Source directory for assets (relative to SITEROOT)")
+    flag.StringVar(&destDir, "dest", "assets-rev", "Destination directory for revisioned assets (relative to SITEROOT)")
 
     flag.Usage = func() {
         fmt.Println(getUsage())
@@ -148,13 +152,13 @@ func parseFlags() (string, string) {
     largs := len(os.Args)
     baseDir := os.Args[largs-1]
 
-    return baseDir, cdnBaseUrl
+    return baseDir, cdnBaseUrl, srcDir, destDir
 }
 
 func main() {
-    baseDir, cdnBaseUrl := parseFlags()
-    manifest := rev(baseDir, cdnBaseUrl)
-    useman(manifest, baseDir)
+    baseDir, cdnBaseUrl, srcDir, destDir := parseFlags()
+    manifest := rev(baseDir, cdnBaseUrl, srcDir, destDir)
+    useman(manifest, baseDir, srcDir)
     jsonData, err := json.MarshalIndent(manifest, "", "  ")
     check(err)
     fmt.Printf("%s\n", jsonData)
