@@ -114,7 +114,7 @@ func repFile(path string, manifest map[string]string, srcDir string) {
 }
 
 func useman(manifest map[string]string, baseDir string, srcDir string) {
-    repath := regexp.MustCompile(`^` + baseDir + `/.+(\.css|\.js|\.html|\.webmanifest)$`)
+    repath := regexp.MustCompile(`^` + baseDir + `/.+(\.css|\.js|\.html|\.toml|\.webmanifest)$`)
     expath := regexp.MustCompile(`^` + baseDir + `/` + srcDir + `/`)
     err := filepath.Walk(baseDir, func(path string, info fs.FileInfo, err error) error {
         check(err)
@@ -151,7 +151,7 @@ func parseFlags() (string, string, string, string) {
     }
 
     flag.Parse()
-    
+
     baseDir := "."
     if flag.NArg() > 0 {
         baseDir = flag.Arg(0)
