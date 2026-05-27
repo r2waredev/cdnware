@@ -71,7 +71,7 @@ func rev(baseDir string, cdnBaseUrl string, srcDir string, destDir string) map[s
         pathPrefix = baseDir + "/"
     }
     lsrcpath := len(pathPrefix)
-    repath := regexp.MustCompile(`^` + regexp.QuoteMeta(pathPrefix+srcDir) + `/.+(\.css|\.js|\.jpg|\.png|\.svg|\.ico|\.mp4|\.woff2|\.avif)$`)
+    repath := regexp.MustCompile(`^` + regexp.QuoteMeta(pathPrefix+srcDir) + `/.+(\.css|\.js|\.jpg|\.png|\.webp|\.svg|\.ico|\.mp4|\.woff2|\.avif)$`)
     err := os.MkdirAll(filepath.Join(baseDir, destDir), os.ModePerm)
     check(err)
     m := make(map[string]string)
@@ -89,7 +89,7 @@ func rev(baseDir string, cdnBaseUrl string, srcDir string, destDir string) map[s
 }
 
 func repFile(path string, manifest map[string]string, srcDir string) {
-    repath := regexp.MustCompile(`["'\(]/` + srcDir + `/.+?(?:\.css|\.js|\.jpg|\.png|\.svg|\.ico|\.mp4|\.woff2|\.avif)["'\)]`)
+    repath := regexp.MustCompile(`["'\(]/` + srcDir + `/.+?(?:\.css|\.js|\.jpg|\.png|\.webp|\.svg|\.ico|\.mp4|\.woff2|\.avif)["'\)]`)
     input, err := ioutil.ReadFile(path)
     check(err)
     lines := strings.Split(string(input), "\n")
