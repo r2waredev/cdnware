@@ -39,10 +39,15 @@ Single-file application (`cdnware.go`) with this flow:
 
 ### Supported Asset Types
 
-Revisioned: `.css`, `.js`, `.jpg`, `.png`, `.svg`, `.ico`, `.mp4`, `.woff2`, `.avif`
+Configurable via `-asset-exts` or `asset_exts` in a config file (default: `.css`, `.js`, `.jpg`, `.png`, `.webp`, `.svg`, `.ico`, `.mp4`, `.woff2`, `.avif`). Source-file extensions scanned for refs are configurable via `-source-exts` / `source_exts` (default: `.css`, `.js`, `.html`, `.toml`, `.webmanifest`).
+
+### Configuration
+
+All settings (`cdn`, `src`, `dest`, `asset_exts`, `source_exts`, `hash_len`) can be set via CLI flags or a `cdnware.{toml,yaml,yml,json}` config file auto-discovered in SITEROOT or CWD. Precedence: flag > file > default. Use `-config <path>` to point at a specific file, or `-config -` to disable auto-discovery.
 
 ### Key Patterns
 
 - Asset references in source files are matched by regex looking for paths in quotes or parentheses: `["'(]/<srcDir>/...["')]`
 - The `-cdn` flag prepends a base URL to all revisioned paths
 - The `-src` and `-dest` flags override the default `assets` and `assets-rev` directories
+- The `-hash-len` flag (1–32) controls hex chars of MD5 hash embedded in filenames
