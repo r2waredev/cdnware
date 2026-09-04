@@ -1,226 +1,350 @@
 package main
 
 import (
+	"bytes"
 	"crypto/md5"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"io/fs"
-	"io/ioutil"
 	"os"
 	"path/filepath"
-	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/BurntSushi/toml"
 	"gopkg.in/yaml.v3"
 )
 
-// Config holds all settings. Pointer fields distinguish "absent" from "zero"
-// so file values can be overridden by explicitly-set CLI flags.
+const (
+	hashLength  = 8
+	defaultSrc  = "assets"
+	defaultDest = "assets-rev"
+)
+
+// Config holds file-backed settings. Pointer fields distinguish an omitted
+// value from an explicit empty string.
 type Config struct {
-	Cdn        *string  `toml:"cdn" yaml:"cdn" json:"cdn,omitempty"`
-	Src        *string  `toml:"src" yaml:"src" json:"src,omitempty"`
-	Dest       *string  `toml:"dest" yaml:"dest" json:"dest,omitempty"`
-	AssetExts  []string `toml:"asset_exts" yaml:"asset_exts" json:"asset_exts,omitempty"`
-	SourceExts []string `toml:"source_exts" yaml:"source_exts" json:"source_exts,omitempty"`
-	HashLen    *int     `toml:"hash_len" yaml:"hash_len" json:"hash_len,omitempty"`
+	Cdn  *string `toml:"cdn" yaml:"cdn" json:"cdn,omitempty"`
+	Src  *string `toml:"src" yaml:"src" json:"src,omitempty"`
+	Dest *string `toml:"dest" yaml:"dest" json:"dest,omitempty"`
 }
 
-// Settings is the resolved, validated configuration used at runtime.
 type Settings struct {
-	BaseDir    string
-	Cdn        string
-	Src        string
-	Dest       string
-	AssetExts  []string
-	SourceExts []string
-	HashLen    int
+	BaseDir string
+	Cdn     string
+	Src     string
+	Dest    string
 }
 
-var defaultAssetExts = []string{"css", "js", "jpg", "png", "webp", "svg", "ico", "mp4", "woff2", "avif"}
-var defaultSourceExts = []string{"css", "js", "html", "toml", "webmanifest"}
+type asset struct {
+	path string
+	rel  string
+	url  string
+	mode fs.FileMode
+}
 
-const defaultSrc = "assets"
-const defaultDest = "assets-rev"
-const defaultHashLen = 8
+type revisioner struct {
+	baseDir string
+	srcDir  string
+	destDir string
+	cdn     string
+	assets  map[string]asset
+	state   map[string]uint8
+	result  map[string]string
+}
 
-func check(err error) {
-	if err == nil {
-		return
+func hashReader(reader io.Reader) (string, error) {
+	hash := md5.New()
+	if _, err := io.Copy(hash, reader); err != nil {
+		return "", err
 	}
-	panic(err)
+	return fmt.Sprintf("%x", hash.Sum(nil))[:hashLength], nil
 }
 
-func hashFile(path string, hashLen int) string {
+func hashFile(path string) string {
 	file, err := os.Open(path)
 	check(err)
 	defer file.Close()
-	hash := md5.New()
-	_, err = io.Copy(hash, file)
+
+	hash, err := hashReader(file)
 	check(err)
-	hashstr := fmt.Sprintf("%x", hash.Sum(nil))
-	hashstr = hashstr[:hashLen]
-	return hashstr
+	return hash
 }
 
-func copyFile(srcPath string, destPath string) {
-	srcFile, err := os.Open(srcPath)
+func hashBytes(content []byte) string {
+	hash, err := hashReader(bytes.NewReader(content))
 	check(err)
-	defer srcFile.Close()
-
-	destFile, err := os.Create(destPath)
-	check(err)
-	defer destFile.Close()
-
-	_, err = io.Copy(destFile, srcFile)
-	check(err)
-
-	err = destFile.Sync()
-	check(err)
+	return hash
 }
 
-func revFile(path string, baseDir string, destDir string, hashLen int) string {
-	fhash := hashFile(path, hashLen)
-	_, fname := filepath.Split(path)
-	parts := strings.Split(fname, ".")
-	lindex := len(parts) - 1
-	parts = append(parts[:lindex], fhash, parts[lindex])
-	hashName := strings.Join(parts, ".")
-	hashPath := filepath.Join(baseDir, destDir, hashName)
-	copyFile(path, hashPath)
-	return hashPath
+func check(err error) {
+	if err != nil {
+		panic(err)
+	}
 }
 
-// parseExts normalizes a list of extensions: trims whitespace, strips leading
-// dots, lowercases, and drops empties. Order is preserved.
-func parseExts(in []string) []string {
-	out := make([]string, 0, len(in))
-	for _, e := range in {
-		e = strings.TrimSpace(e)
-		e = strings.TrimPrefix(e, ".")
-		e = strings.ToLower(e)
-		if e == "" {
+func revisionedName(rel, hash string) string {
+	ext := filepath.Ext(rel)
+	stem := strings.TrimSuffix(rel, ext)
+	if ext == "" {
+		return stem + "." + hash
+	}
+	return stem + "." + hash + ext
+}
+
+func publicURL(cdn, path string) string {
+	path = "/" + strings.TrimLeft(filepath.ToSlash(path), "/")
+	if cdn == "" {
+		return path
+	}
+	return strings.TrimRight(cdn, "/") + path
+}
+
+func newRevisioner(baseDir, cdn, srcDir, destDir string) (*revisioner, error) {
+	if filepath.Clean(srcDir) == filepath.Clean(destDir) {
+		return nil, errors.New("source and destination directories must differ")
+	}
+
+	r := &revisioner{
+		baseDir: baseDir,
+		srcDir:  filepath.Clean(srcDir),
+		destDir: filepath.Clean(destDir),
+		cdn:     cdn,
+		assets:  make(map[string]asset),
+		state:   make(map[string]uint8),
+		result:  make(map[string]string),
+	}
+
+	sourceRoot := filepath.Join(baseDir, r.srcDir)
+	err := filepath.WalkDir(sourceRoot, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+
+		rel, err := filepath.Rel(sourceRoot, path)
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		url := "/" + filepath.ToSlash(filepath.Join(r.srcDir, rel))
+		r.assets[url] = asset{path: path, rel: rel, url: url, mode: info.Mode()}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("walking source assets: %w", err)
+	}
+
+	return r, nil
+}
+
+func isRewritableAsset(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".css", ".html", ".js", ".json", ".mjs", ".svg", ".toml", ".webmanifest", ".xml":
+		return true
+	default:
+		return false
+	}
+}
+
+type replacement struct {
+	old string
+	url string
+}
+
+func (r *revisioner) dependencies(current asset, content []byte) []replacement {
+	replacements := make([]replacement, 0)
+	currentDir := filepath.Dir(current.rel)
+
+	for sourceURL, dependency := range r.assets {
+		if dependency.url == current.url {
 			continue
 		}
-		out = append(out, e)
-	}
-	return out
-}
-
-// buildExtAlt turns ["css","js"] into `\.css|\.js`, regex-escaped.
-func buildExtAlt(exts []string) string {
-	parts := make([]string, len(exts))
-	for i, e := range exts {
-		parts[i] = `\.` + regexp.QuoteMeta(e)
-	}
-	return strings.Join(parts, "|")
-}
-
-func rev(baseDir string, cdnBaseUrl string, srcDir string, destDir string, assetExts []string, hashLen int) map[string]string {
-	// Build regex pattern - handle "." baseDir specially since filepath.Walk
-	// returns paths without "./" prefix
-	var pathPrefix string
-	if baseDir == "." {
-		pathPrefix = ""
-	} else {
-		pathPrefix = baseDir + "/"
-	}
-	lsrcpath := len(pathPrefix)
-	extAlt := buildExtAlt(assetExts)
-	repath := regexp.MustCompile(`^` + regexp.QuoteMeta(pathPrefix+srcDir) + `/.+(` + extAlt + `)$`)
-	err := os.MkdirAll(filepath.Join(baseDir, destDir), os.ModePerm)
-	check(err)
-	m := make(map[string]string)
-	err = filepath.Walk(baseDir, func(path string, info fs.FileInfo, err error) error {
-		check(err)
-		matched := repath.MatchString(path)
-		if matched == true {
-			rev := revFile(path, baseDir, destDir, hashLen)[lsrcpath:]
-			m["/"+path[lsrcpath:]] = fmt.Sprintf("%s/%s", cdnBaseUrl, rev)
+		if bytes.Contains(content, []byte(sourceURL)) {
+			replacements = append(replacements, replacement{old: sourceURL, url: dependency.url})
 		}
-		return nil
+
+		rel, err := filepath.Rel(currentDir, dependency.rel)
+		if err != nil {
+			continue
+		}
+		rel = filepath.ToSlash(rel)
+		if !strings.HasPrefix(rel, ".") {
+			rel = "./" + rel
+		}
+		if bytes.Contains(content, []byte(rel)) {
+			replacements = append(replacements, replacement{old: rel, url: dependency.url})
+		}
+	}
+
+	sort.Slice(replacements, func(i, j int) bool {
+		return len(replacements[i].old) > len(replacements[j].old)
 	})
-	check(err)
-	return m
+	return replacements
 }
 
-func repFile(path string, manifest map[string]string, srcDir string, assetExts []string) {
-	extAlt := buildExtAlt(assetExts)
-	repath := regexp.MustCompile(`["'\(]/` + regexp.QuoteMeta(srcDir) + `/.+?(?:` + extAlt + `)["'\)]`)
-	input, err := ioutil.ReadFile(path)
-	check(err)
-	lines := strings.Split(string(input), "\n")
-	for i, line := range lines {
-		matches := repath.FindAllString(line, -1)
-		for _, match := range matches {
-			lm := len(match)
-			sq := match[0:1]     // start quote ("|')
-			eq := match[lm-1 : lm] // end quote ("|')
-			orig := match[1 : lm-1]
-			rev, ok := manifest[orig]
-			if ok {
-				rep := fmt.Sprintf("%s%s%s", sq, rev, eq)
-				line = strings.Replace(line, match, rep, 1)
+func (r *revisioner) writeAsset(sourceURL string) (string, error) {
+	if r.state[sourceURL] == 2 {
+		return r.result[sourceURL], nil
+	}
+	if r.state[sourceURL] == 1 {
+		return "", fmt.Errorf("asset reference cycle involving %s", sourceURL)
+	}
+
+	current, ok := r.assets[sourceURL]
+	if !ok {
+		return "", fmt.Errorf("unknown asset %s", sourceURL)
+	}
+	r.state[sourceURL] = 1
+
+	content, err := os.ReadFile(current.path)
+	if err != nil {
+		return "", fmt.Errorf("reading %s: %w", current.path, err)
+	}
+	if isRewritableAsset(current.path) {
+		for _, replacement := range r.dependencies(current, content) {
+			dependencyURL, err := r.writeAsset(replacement.url)
+			if err != nil {
+				return "", err
 			}
+			content = bytes.ReplaceAll(content, []byte(replacement.old), []byte(dependencyURL))
 		}
-		lines[i] = line
 	}
-	output := strings.Join(lines, "\n")
-	err = ioutil.WriteFile(path, []byte(output), 0644)
-	check(err)
+
+	hash := hashBytes(content)
+	destRel := revisionedName(current.rel, hash)
+	destPath := filepath.Join(r.baseDir, r.destDir, destRel)
+	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+		return "", fmt.Errorf("creating destination directory: %w", err)
+	}
+	if err := os.WriteFile(destPath, content, current.mode.Perm()); err != nil {
+		return "", fmt.Errorf("writing %s: %w", destPath, err)
+	}
+
+	url := publicURL(r.cdn, filepath.Join(r.destDir, destRel))
+	r.result[sourceURL] = url
+	r.state[sourceURL] = 2
+	return url, nil
 }
 
-func useman(manifest map[string]string, baseDir string, srcDir string, sourceExts []string, assetExts []string) {
-	extAlt := buildExtAlt(sourceExts)
-	repath := regexp.MustCompile(`^` + regexp.QuoteMeta(baseDir) + `/.+(` + extAlt + `)$`)
-	expath := regexp.MustCompile(`^` + regexp.QuoteMeta(baseDir) + `/` + regexp.QuoteMeta(srcDir) + `/`)
-	err := filepath.Walk(baseDir, func(path string, info fs.FileInfo, err error) error {
-		check(err)
-		matched := repath.MatchString(path)
-		excluded := expath.MatchString(path)
-		if matched == true && excluded != true {
-			repFile(path, manifest, srcDir, assetExts)
+func (r *revisioner) revise() (map[string]string, error) {
+	destination := filepath.Join(r.baseDir, r.destDir)
+	if err := os.RemoveAll(destination); err != nil {
+		return nil, fmt.Errorf("clearing destination: %w", err)
+	}
+
+	urls := make([]string, 0, len(r.assets))
+	for url := range r.assets {
+		urls = append(urls, url)
+	}
+	sort.Strings(urls)
+	for _, url := range urls {
+		if _, err := r.writeAsset(url); err != nil {
+			return nil, err
+		}
+	}
+	return r.result, nil
+}
+
+func rev(baseDir, cdn, srcDir, destDir string) map[string]string {
+	revisioner, err := newRevisioner(baseDir, cdn, srcDir, destDir)
+	check(err)
+	manifest, err := revisioner.revise()
+	check(err)
+	return manifest
+}
+
+func isReferenceSource(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".css", ".html", ".js", ".json", ".mjs", ".toml", ".webmanifest", ".xml":
+		return true
+	default:
+		return false
+	}
+}
+
+func repFile(path string, manifest map[string]string) error {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	original := content
+
+	keys := make([]string, 0, len(manifest))
+	for sourceURL := range manifest {
+		keys = append(keys, sourceURL)
+	}
+	sort.Slice(keys, func(i, j int) bool { return len(keys[i]) > len(keys[j]) })
+	for _, sourceURL := range keys {
+		content = bytes.ReplaceAll(content, []byte(sourceURL), []byte(manifest[sourceURL]))
+	}
+	if bytes.Equal(content, original) {
+		return nil
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, content, info.Mode().Perm())
+}
+
+func useman(manifest map[string]string, baseDir, srcDir, destDir string) error {
+	sourceRoot := filepath.Clean(filepath.Join(baseDir, srcDir))
+	destinationRoot := filepath.Clean(filepath.Join(baseDir, destDir))
+
+	return filepath.WalkDir(baseDir, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		cleanPath := filepath.Clean(path)
+		if entry.IsDir() && (cleanPath == sourceRoot || cleanPath == destinationRoot) {
+			return filepath.SkipDir
+		}
+		if !entry.Type().IsRegular() || !isReferenceSource(path) {
+			return nil
+		}
+		if err := repFile(path, manifest); err != nil {
+			return fmt.Errorf("rewriting %s: %w", path, err)
 		}
 		return nil
 	})
-	check(err)
 }
 
-// loadConfigFile decodes a config file based on its extension. Returns
-// (nil, nil) if path is empty.
 func loadConfigFile(path string) (*Config, error) {
 	if path == "" {
 		return nil, nil
 	}
-	data, err := ioutil.ReadFile(path)
+
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading config %s: %w", path, err)
 	}
 	cfg := &Config{}
-	ext := strings.ToLower(filepath.Ext(path))
-	switch ext {
+	switch strings.ToLower(filepath.Ext(path)) {
 	case ".toml":
-		if err := toml.Unmarshal(data, cfg); err != nil {
-			return nil, fmt.Errorf("parsing TOML %s: %w", path, err)
-		}
+		err = toml.Unmarshal(data, cfg)
 	case ".yaml", ".yml":
-		if err := yaml.Unmarshal(data, cfg); err != nil {
-			return nil, fmt.Errorf("parsing YAML %s: %w", path, err)
-		}
+		err = yaml.Unmarshal(data, cfg)
 	case ".json":
-		if err := json.Unmarshal(data, cfg); err != nil {
-			return nil, fmt.Errorf("parsing JSON %s: %w", path, err)
-		}
+		err = json.Unmarshal(data, cfg)
 	default:
 		return nil, fmt.Errorf("unknown config format for %s (expected .toml/.yaml/.yml/.json)", path)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("parsing config %s: %w", path, err)
 	}
 	return cfg, nil
 }
 
-// discoverConfig searches SITEROOT then CWD for a config file. Returns the
-// first existing path or "" if none found.
 func discoverConfig(siteroot string) string {
 	names := []string{"cdnware.toml", "cdnware.yaml", "cdnware.yml", "cdnware.json"}
 	dirs := []string{siteroot}
@@ -229,129 +353,67 @@ func discoverConfig(siteroot string) string {
 	}
 	for _, dir := range dirs {
 		for _, name := range names {
-			p := filepath.Join(dir, name)
-			if _, err := os.Stat(p); err == nil {
-				return p
+			path := filepath.Join(dir, name)
+			if _, err := os.Stat(path); err == nil {
+				return path
 			}
 		}
 	}
 	return ""
 }
 
-// flagSet wraps flag definitions so we can detect which flags were explicitly
-// passed (via flag.Visit) for merge precedence.
 type flagSet struct {
-	fs           *flag.FlagSet
-	cdn          string
-	src          string
-	dest         string
-	assetExts    string
-	sourceExts   string
-	hashLen      int
-	configPath   string
+	fs         *flag.FlagSet
+	cdn        string
+	src        string
+	dest       string
+	configPath string
 }
 
-func splitCsv(s string) []string {
-	if s == "" {
-		return nil
+func mergeSettings(baseDir string, fileCfg *Config, fs *flagSet, explicit map[string]bool) Settings {
+	settings := Settings{
+		BaseDir: baseDir,
+		Src:     defaultSrc,
+		Dest:    defaultDest,
 	}
-	return strings.Split(s, ",")
-}
-
-// mergeSettings applies precedence: defaults < file < explicitly-set flags.
-func mergeSettings(baseDir string, fileCfg *Config, fs *flagSet, explicit map[string]bool) (Settings, error) {
-	s := Settings{
-		BaseDir:    baseDir,
-		Cdn:        "",
-		Src:        defaultSrc,
-		Dest:       defaultDest,
-		AssetExts:  append([]string(nil), defaultAssetExts...),
-		SourceExts: append([]string(nil), defaultSourceExts...),
-		HashLen:    defaultHashLen,
-	}
-
 	if fileCfg != nil {
 		if fileCfg.Cdn != nil {
-			s.Cdn = *fileCfg.Cdn
+			settings.Cdn = *fileCfg.Cdn
 		}
 		if fileCfg.Src != nil {
-			s.Src = *fileCfg.Src
+			settings.Src = *fileCfg.Src
 		}
 		if fileCfg.Dest != nil {
-			s.Dest = *fileCfg.Dest
-		}
-		if fileCfg.AssetExts != nil {
-			s.AssetExts = fileCfg.AssetExts
-		}
-		if fileCfg.SourceExts != nil {
-			s.SourceExts = fileCfg.SourceExts
-		}
-		if fileCfg.HashLen != nil {
-			s.HashLen = *fileCfg.HashLen
+			settings.Dest = *fileCfg.Dest
 		}
 	}
-
 	if explicit["cdn"] {
-		s.Cdn = fs.cdn
+		settings.Cdn = fs.cdn
 	}
 	if explicit["src"] {
-		s.Src = fs.src
+		settings.Src = fs.src
 	}
 	if explicit["dest"] {
-		s.Dest = fs.dest
+		settings.Dest = fs.dest
 	}
-	if explicit["asset-exts"] {
-		s.AssetExts = splitCsv(fs.assetExts)
-	}
-	if explicit["source-exts"] {
-		s.SourceExts = splitCsv(fs.sourceExts)
-	}
-	if explicit["hash-len"] {
-		s.HashLen = fs.hashLen
-	}
-
-	s.AssetExts = parseExts(s.AssetExts)
-	s.SourceExts = parseExts(s.SourceExts)
-
-	if len(s.AssetExts) == 0 {
-		return s, fmt.Errorf("asset_exts is empty after normalization")
-	}
-	if len(s.SourceExts) == 0 {
-		return s, fmt.Errorf("source_exts is empty after normalization")
-	}
-	if s.HashLen < 1 || s.HashLen > 32 {
-		return s, fmt.Errorf("hash_len must be between 1 and 32, got %d", s.HashLen)
-	}
-
-	return s, nil
+	return settings
 }
 
 func getUsage() string {
-	usage := `Usage of cdnware:
-
-$ cdnware [OPTIONS] [SITEROOT]
-`
-	return usage
+	return "Usage of cdnware:\n\n$ cdnware [OPTIONS] [SITEROOT]\n"
 }
 
-// loadSettings parses CLI flags, discovers/loads the config file, merges, and
-// validates. Returns the resolved Settings.
 func loadSettings(args []string) (Settings, error) {
 	fs := &flagSet{fs: flag.NewFlagSet("cdnware", flag.ContinueOnError)}
-	fs.fs.StringVar(&fs.cdn, "cdn", "", "CDN base url")
-	fs.fs.StringVar(&fs.src, "src", defaultSrc, "Source directory for assets (relative to SITEROOT)")
-	fs.fs.StringVar(&fs.dest, "dest", defaultDest, "Destination directory for revisioned assets (relative to SITEROOT)")
-	fs.fs.StringVar(&fs.assetExts, "asset-exts", strings.Join(defaultAssetExts, ","), "Comma-separated asset extensions to rev")
-	fs.fs.StringVar(&fs.sourceExts, "source-exts", strings.Join(defaultSourceExts, ","), "Comma-separated source-file extensions to rewrite")
-	fs.fs.IntVar(&fs.hashLen, "hash-len", defaultHashLen, "Hex chars of MD5 hash to embed in filename (1-32)")
+	fs.fs.StringVar(&fs.cdn, "cdn", "", "CDN base URL")
+	fs.fs.StringVar(&fs.src, "src", defaultSrc, "source directory for assets, relative to SITEROOT")
+	fs.fs.StringVar(&fs.dest, "dest", defaultDest, "destination directory for revisioned assets, relative to SITEROOT")
 	fs.fs.StringVar(&fs.configPath, "config", "", `Path to config file (.toml/.yaml/.yml/.json). Use "-" to disable auto-discovery.`)
-
 	fs.fs.Usage = func() {
 		fmt.Println(getUsage())
 		fmt.Println("Options:")
 		fs.fs.PrintDefaults()
 	}
-
 	if err := fs.fs.Parse(args); err != nil {
 		return Settings{}, err
 	}
@@ -360,7 +422,6 @@ func loadSettings(args []string) (Settings, error) {
 	if fs.fs.NArg() > 0 {
 		baseDir = fs.fs.Arg(0)
 	}
-
 	explicit := map[string]bool{}
 	fs.fs.Visit(func(f *flag.Flag) {
 		explicit[f.Name] = true
@@ -370,32 +431,27 @@ func loadSettings(args []string) (Settings, error) {
 	var err error
 	switch fs.configPath {
 	case "":
-		if p := discoverConfig(baseDir); p != "" {
-			fileCfg, err = loadConfigFile(p)
-			if err != nil {
-				return Settings{}, err
-			}
+		if path := discoverConfig(baseDir); path != "" {
+			fileCfg, err = loadConfigFile(path)
 		}
 	case "-":
-		// explicit opt-out of auto-discovery
 	default:
 		fileCfg, err = loadConfigFile(fs.configPath)
-		if err != nil {
-			return Settings{}, err
-		}
 	}
-
-	return mergeSettings(baseDir, fileCfg, fs, explicit)
+	if err != nil {
+		return Settings{}, err
+	}
+	return mergeSettings(baseDir, fileCfg, fs, explicit), nil
 }
 
 func main() {
 	settings, err := loadSettings(os.Args[1:])
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(2)
-	}
-	manifest := rev(settings.BaseDir, settings.Cdn, settings.Src, settings.Dest, settings.AssetExts, settings.HashLen)
-	useman(manifest, settings.BaseDir, settings.Src, settings.SourceExts, settings.AssetExts)
+	check(err)
+	revisioner, err := newRevisioner(settings.BaseDir, settings.Cdn, settings.Src, settings.Dest)
+	check(err)
+	manifest, err := revisioner.revise()
+	check(err)
+	check(useman(manifest, settings.BaseDir, settings.Src, settings.Dest))
 	jsonData, err := json.MarshalIndent(manifest, "", "  ")
 	check(err)
 	fmt.Printf("%s\n", jsonData)

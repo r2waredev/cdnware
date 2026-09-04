@@ -24,8 +24,7 @@ Suppose you built your jekyll site to the standard `_site` folder.
 $ cdnware -cdn https://cdn.example.com/some-path _site
 ```
 
-All of the assets in `_site/assets` will be revved and moved to `_site/assets-rev`
-then a json hash map will be printed to standard out.
+Every file in `_site/assets` is copied to `_site/assets-rev` with an 8-character content hash. Nested directories are preserved. References in the generated site and between textual assets are rewritten before hashing, including responsive-image `srcset` URLs and relative JavaScript imports. The source assets remain unchanged, and a JSON manifest is printed to standard output.
 
 Ex:
 
@@ -85,15 +84,10 @@ All settings can be set via CLI flag or a config file. Precedence is
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
-| `-cdn` | `""` | CDN base url |
+| `-cdn` | `""` | CDN base URL |
 | `-src` | `assets` | Source asset directory (relative to SITEROOT) |
 | `-dest` | `assets-rev` | Destination directory for revisioned assets |
-| `-asset-exts` | `css,js,jpg,png,webp,svg,ico,mp4,woff2,avif` | Extensions to rev |
-| `-source-exts` | `css,js,html,toml,webmanifest` | File types to scan and rewrite |
-| `-hash-len` | `8` | Hex chars of MD5 hash to embed (1–32) |
 | `-config` | _auto_ | Path to config file; use `-` to disable auto-discovery |
-
-Extensions may be written with or without a leading dot (`png` and `.png` both work).
 
 ### Config file
 
@@ -103,31 +97,25 @@ If `-config` is not given, cdnware looks in SITEROOT then CWD for, in order:
 ```toml
 # cdnware.toml
 cdn = "https://cdn.example.com/v3"
-asset_exts = ["css", "js", "png", "webp", "avif"]
-source_exts = ["html", "xml"]
-hash_len = 10
+src = "assets"
+dest = "assets-rev"
 ```
 
 ```yaml
 # cdnware.yml
 cdn: https://cdn.example.com/v3
-asset_exts: [css, js, png, webp, avif]
-source_exts: [html, xml]
-hash_len: 10
+src: assets
+dest: assets-rev
 ```
 
 ```json
 {
   "cdn": "https://cdn.example.com/v3",
-  "asset_exts": ["css", "js", "png", "webp", "avif"],
-  "source_exts": ["html", "xml"],
-  "hash_len": 10
+  "src": "assets",
+  "dest": "assets-rev"
 }
 ```
 
 ## Philosophy
 
-This tool is meant to be simple to use and adaptable for many different workflows.
-While it was designed specifically for use with Jekyll, it works completely outside
-the built-in jekyll build command and it can be incorporated easily for other
-web build stacks.
+The command keeps one interface for the full deployment transformation: point it at the generated site. It inventories the asset tree, resolves the asset-reference graph, writes content-addressed files, and rewrites generated references. Cyclic asset references fail the build because mutually content-addressed filenames cannot be stable.
